@@ -1,28 +1,162 @@
 # image_converter_flask.py
 from flask import Flask, request, jsonify
 from io import BytesIO
-from PIL import Image
-import requests, base64, os, math, sys, traceback
+from PIL import Image, ImageFile
+import requests, base64, os, math, sys, traceback, time
+from urllib3.util import Retry
+from requests.adapters import HTTPAdapter
 
 app = Flask(__name__)
 
 # ===== CONFIG DEFAULTS =====
 DEFAULT_RESIZE_FACTOR = 7
 DEFAULT_MAX_PIXELS = 40_000_000
-USER_AGENT = "ImageConverterFlask/1.0"
-REQUEST_TIMEOUT = 12
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " \
+             "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 ImageConverter/1.0"
+REQUEST_CONNECT_TIMEOUT = 4.0   # seconds to connect
+REQUEST_READ_TIMEOUT = 10.0     # seconds to read
+REQUEST_TIMEOUT = (REQUEST_CONNECT_TIMEOUT, REQUEST_READ_TIMEOUT)
+MAX_DOWNLOAD_BYTES = 80 * 1024 * 1024  # 80 MB hard cap on raw download
+STREAM_CHUNK = 16 * 1024  # 16KB
+POOL_MAXSIZE = 50
+RETRIES_TOTAL = 3
 # ===========================
+
+# Improve PIL resilience for truncated/progressive images
+ImageFile.LOAD_TRUNCATED_IMAGES = True
+ImageFile.MAX_IMAGE_PIXELS = None  # we'll enforce pixels manually in code
 
 def logi(msg): print("[Converter][INFO] " + str(msg))
 def logd(msg): print("[Converter][DEBUG] " + str(msg))
 def logw(msg): print("[Converter][WARN] " + str(msg))
 def loge(msg): print("[Converter][ERROR] " + str(msg))
 
-def download_image_bytes(url, timeout=REQUEST_TIMEOUT):
-    headers = {"User-Agent": USER_AGENT}
-    resp = requests.get(url, headers=headers, timeout=timeout)
-    resp.raise_for_status()
-    return resp.content
+# Create a single session with retry + connection pooling and sensible headers
+session = requests.Session()
+retry_strategy = Retry(
+    total=RETRIES_TOTAL,
+    status_forcelist=[429, 500, 502, 503, 504],
+    allowed_methods=["HEAD", "GET", "OPTIONS"],
+    backoff_factor=0.6
+)
+adapter = HTTPAdapter(max_retries=retry_strategy, pool_maxsize=POOL_MAXSIZE)
+session.mount("http://", adapter)
+session.mount("https://", adapter)
+# Default headers that mimic a real browser and accept modern image formats
+BASE_HEADERS = {
+    "User-Agent": USER_AGENT,
+    "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Connection": "keep-alive",
+    "Referer": ""  # intentionally blank; set per-request if needed
+}
+
+def is_image_content_type(ct):
+    if not ct:
+        return False
+    ct = ct.lower()
+    return ct.startswith("image/")
+
+def safe_head(url, headers, timeout):
+    """Attempt HEAD to get content-length and content-type. Some servers block HEAD; return None on failure."""
+    try:
+        r = session.head(url, headers=headers, allow_redirects=True, timeout=timeout)
+        return r
+    except Exception as e:
+        logd(f"HEAD failed for {url}: {e}")
+        return None
+
+def try_alternate_scheme(url):
+    """If http -> https or https -> http might help for misconfigured endpoints."""
+    if url.startswith("http://"):
+        return "https://" + url[len("http://"):]
+    if url.startswith("https://"):
+        return "http://" + url[len("https://"):]
+    return url
+
+def download_image_bytes(url, timeout=REQUEST_TIMEOUT, max_bytes=MAX_DOWNLOAD_BYTES):
+    """
+    Robust downloader:
+      - Attempts HEAD to check content-type/length
+      - Streams GET with chunked reads
+      - Enforces max_bytes cutoff
+      - Retries automatically via the session adapter
+      - Falls back to alternate scheme and a few header variants
+    Returns bytes or raises an exception with a helpful message.
+    """
+    start_ts = time.time()
+    headers = dict(BASE_HEADERS)  # copy
+
+    tried_urls = []
+    tried_exceptions = []
+
+    candidate_urls = [url]
+    # try swapping scheme as a fallback
+    alt = try_alternate_scheme(url)
+    if alt != url:
+        candidate_urls.append(alt)
+
+    # If URL has query params, try stripping them as a last resort (some CDNs choke)
+    if "?" in url:
+        candidate_urls.append(url.split("?", 1)[0])
+
+    for candidate in candidate_urls:
+        tried_urls.append(candidate)
+        headers["Referer"] = candidate  # some servers require referer-ish header
+        # HEAD check first
+        head = safe_head(candidate, headers, timeout)
+        content_length = None
+        content_type = None
+        if head is not None:
+            content_length = head.headers.get("Content-Length")
+            content_type = head.headers.get("Content-Type")
+            logd(f"HEAD: url={candidate} content-type={content_type} content-length={content_length}")
+            if content_length:
+                try:
+                    cl = int(content_length)
+                    if cl > max_bytes:
+                        raise ValueError(f"Remote content-length {cl} exceeds max allowed {max_bytes} bytes")
+                except ValueError as ve:
+                    # If content-length is bogus or too large, skip this candidate
+                    logw(f"HEAD size check failed for {candidate}: {ve}")
+                    tried_exceptions.append(str(ve))
+                    continue
+
+            if content_type and not is_image_content_type(content_type):
+                logw(f"HEAD says content-type {content_type} is not image; skipping {candidate}")
+                tried_exceptions.append(f"non-image content-type {content_type}")
+                continue
+
+        # Try GET with stream
+        try:
+            with session.get(candidate, headers=headers, stream=True, timeout=timeout, allow_redirects=True) as resp:
+                resp.raise_for_status()
+                # Respect server-provided content-type if present
+                ct = resp.headers.get("Content-Type", content_type)
+                if ct and not is_image_content_type(ct):
+                    raise ValueError(f"Server returned non-image Content-Type: {ct}")
+
+                buf = BytesIO()
+                total = 0
+                for chunk in resp.iter_content(chunk_size=STREAM_CHUNK):
+                    if chunk:
+                        buf.write(chunk)
+                        total += len(chunk)
+                        if total > max_bytes:
+                            raise ValueError(f"Download exceeded max bytes ({max_bytes}) - aborting")
+                data = buf.getvalue()
+                elapsed = time.time() - start_ts
+                logd(f"Downloaded {len(data)} bytes from {candidate} in {elapsed:.2f}s")
+                return data
+        except Exception as e:
+            logw(f"GET failed for {candidate}: {e}")
+            tried_exceptions.append(f"{candidate}: {e}")
+            # try next candidate
+            continue
+
+    # If we reach here, all attempts failed
+    raise RuntimeError(f"All download attempts failed for {url}. Tried: {tried_urls}. Errors: {tried_exceptions}")
 
 def pil_to_rgb_bytes(img):
     if img.mode != "RGB":
@@ -52,23 +186,38 @@ def render():
     except Exception:
         resize_factor = DEFAULT_RESIZE_FACTOR
 
+    # sanitize max_pixels
+    try:
+        max_pixels = int(max_pixels)
+        if max_pixels < 1:
+            max_pixels = DEFAULT_MAX_PIXELS
+    except Exception:
+        max_pixels = DEFAULT_MAX_PIXELS
+
     logi(f"Request: url={url} resize_factor={resize_factor} max_pixels={max_pixels}")
 
-    # Download
+    # Download with robust downloader
     try:
-        img_bytes = download_image_bytes(url)
+        img_bytes = download_image_bytes(url, timeout=REQUEST_TIMEOUT, max_bytes=MAX_DOWNLOAD_BYTES)
         logd(f"Downloaded {len(img_bytes)} bytes from {url}")
     except Exception as e:
         loge("Download failed: " + str(e))
         return jsonify({"error": f"Failed to download image: {e}"}), 400
 
-    # Open with PIL
+    # Open with PIL (use incremental parser for robustness + to accept progressive JPEG/PNG)
     try:
-        img = Image.open(BytesIO(img_bytes))
-        logd(f"Opened image - mode={img.mode}, size={img.size}, format={img.format}")
+        parser = ImageFile.Parser()
+        parser.feed(img_bytes)
+        img = parser.close()
+        logd(f"Opened image - mode={img.mode}, size={img.size}, format={getattr(img, 'format', None)}")
     except Exception as e:
-        loge("Image open failed: " + str(e))
-        return jsonify({"error": f"Failed to open image: {e}"}), 400
+        # fallback: try Image.open normally
+        try:
+            img = Image.open(BytesIO(img_bytes))
+            logd(f"Fallback open succeeded - mode={img.mode}, size={img.size}, format={img.format}")
+        except Exception as e2:
+            loge("Image open failed: " + str(e2))
+            return jsonify({"error": f"Failed to open image: {e2}"}), 400
 
     # convert to RGB
     if img.mode != "RGB":
@@ -77,11 +226,19 @@ def render():
     orig_w, orig_h = img.size
     logi(f"Original size: {orig_w}x{orig_h}")
 
-    # primary downscale: integer division by resize_factor
-    new_w = max(1, orig_w // resize_factor)
-    new_h = max(1, orig_h // resize_factor)
-    logi(f"Primary downscale: {orig_w}x{orig_h} -> {new_w}x{new_h} (factor {resize_factor})")
-    if (new_w, new_h) != (orig_w, orig_h):
+    # Primary downscale: use thumbnail (fast, in-place, preserves aspect ratio)
+    try:
+        # Compute target size after integer division resize_factor
+        target_w = max(1, orig_w // resize_factor)
+        target_h = max(1, orig_h // resize_factor)
+        logi(f"Primary downscale target: {target_w}x{target_h} (factor {resize_factor})")
+        # Use LANCZOS via thumbnail by passing a tuple
+        img.thumbnail((target_w, target_h), resample=Image.LANCZOS)
+        new_w, new_h = img.size
+    except Exception as e:
+        logw("thumbnail downscale failed, attempting fallback resize: " + str(e))
+        new_w = max(1, orig_w // resize_factor)
+        new_h = max(1, orig_h // resize_factor)
         img = img.resize((new_w, new_h), Image.LANCZOS)
 
     # enforce max_pixels: if still larger, scale further proportionally
